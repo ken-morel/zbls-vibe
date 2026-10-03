@@ -42,7 +42,7 @@ pub const PublishDiagnosticsParams = struct {
 
 pub const Config = struct {
     zig_path: []const u8 = "zig",
-    build_args: []const []const u8 = &.{ "build", "-fincremental", "--watch", "--color", "off" },
+    build_args: []const []const u8 = &.{ "build", "-fincremental", "--watch" },
     extra_args: []const []const u8 = &.{},
     debounce_ms: ?u32 = null,
 };

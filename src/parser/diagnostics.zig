@@ -23,6 +23,7 @@ pub const RawMessage = struct {
 };
 
 pub const BuildEvent = union(enum) {
+    build_started,
     clean_success,
     diagnostics_ready: []RawMessage,
     none,
@@ -36,6 +37,7 @@ pub const DiagnosticsParser = struct {
     /// be attributed to it.
     last_kind: enum { diag, note, other } = .other,
     in_reference_trace: bool = false,
+    building: bool = false,
 
     pub fn init(allocator: Allocator, workspace_root: []const u8) DiagnosticsParser {
         return .{
@@ -65,17 +67,20 @@ pub const DiagnosticsParser = struct {
     pub fn flush(self: *DiagnosticsParser) !BuildEvent {
         self.last_kind = .other;
         self.in_reference_trace = false;
+        self.building = false;
         if (self.current_messages.items.len == 0) return .none;
         return .{ .diagnostics_ready = try self.current_messages.toOwnedSlice(self.allocator) };
     }
 
     pub fn processLine(self: *DiagnosticsParser, raw_line: []const u8) !BuildEvent {
-        const line = std.mem.trimEnd(u8, raw_line, "\r\n");
+        var clean_buf: [4096]u8 = undefined;
+        const line = std.mem.trimEnd(u8, stripAnsi(&clean_buf, raw_line), "\r\n");
 
         // End of a build cycle.
         if (std.mem.startsWith(u8, line, "Build Summary:")) {
             self.in_reference_trace = false;
             self.last_kind = .other;
+            self.building = false;
             const failed = std.mem.indexOf(u8, line, "failed") != null;
             if (!failed) {
                 self.clear();
@@ -86,6 +91,12 @@ pub const DiagnosticsParser = struct {
             // replace the previous set of diagnostics.
             const result = try self.current_messages.toOwnedSlice(self.allocator);
             return .{ .diagnostics_ready = result };
+        }
+
+        var started_event = false;
+        if (!self.building and isBuildStartLine(line)) {
+            self.building = true;
+            started_event = true;
         }
 
         // "      ^~~~" underline: applies to whatever diagnostic/note was
@@ -148,11 +159,11 @@ pub const DiagnosticsParser = struct {
                 });
                 self.last_kind = .diag;
             }
+            if (started_event) return .build_started;
             return .none;
         }
 
-        // Source excerpt lines etc. keep the last_kind so the following caret
-        // line is attributed correctly.
+        if (started_event) return .build_started;
         return .none;
     }
 
@@ -303,6 +314,45 @@ fn parseUnderline(line: []const u8) ?Underline {
     };
 }
 
+/// Strip ANSI escape codes (ECMA-48 CSI sequences like `\x1b[31;1m`) into `buf`.
+pub fn stripAnsi(buf: []u8, raw: []const u8) []const u8 {
+    var out_idx: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len and out_idx < buf.len) {
+        if (raw[i] == 0x1b and i + 1 < raw.len and raw[i + 1] == '[') {
+            i += 2;
+            while (i < raw.len and (raw[i] >= 0x20 and raw[i] <= 0x3f)) {
+                i += 1;
+            }
+            if (i < raw.len and raw[i] >= 0x40 and raw[i] <= 0x7e) {
+                i += 1;
+            }
+        } else {
+            buf[out_idx] = raw[i];
+            out_idx += 1;
+            i += 1;
+        }
+    }
+    return buf[0..out_idx];
+}
+
+/// Returns true if a line likely marks the beginning of a build or rebuild cycle.
+pub fn isBuildStartLine(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    // Don't treat post-build failure summary lines as starting a build
+    if (std.mem.indexOf(u8, trimmed, "transitive failure") != null) return false;
+    if (std.mem.startsWith(u8, trimmed, "Build Summary:")) return false;
+    // Common start steps: "install", "check", "run", "test"
+    if (std.mem.eql(u8, trimmed, "install") or
+        std.mem.eql(u8, trimmed, "check") or
+        std.mem.eql(u8, trimmed, "run") or
+        std.mem.eql(u8, trimmed, "test")) return true;
+    if (std.mem.startsWith(u8, trimmed, "+- ") and std.mem.indexOf(u8, trimmed, "failure") == null) return true;
+    if (parseDiagLine(trimmed) != null) return true;
+    return false;
+}
+
 /// Apply an underline to a range anchored at `col` (0-based).
 fn applyUnderline(u: Underline, col: u32) struct { start: u32, end: u32 } {
     // If the caret lines up with the reported column, trust the leading
@@ -423,3 +473,18 @@ test parseLocation {
     try std.testing.expectEqual(4, l.col);
     try std.testing.expect(parseLocation("Build Summary: 3/3") == null);
 }
+
+test stripAnsi {
+    var buf: [128]u8 = undefined;
+    const clean = stripAnsi(&buf, "\x1b[31;1merror:\x1b[0m expected ';'");
+    try std.testing.expectEqualStrings("error: expected ';'", clean);
+}
+
+test isBuildStartLine {
+    try std.testing.expect(isBuildStartLine("install"));
+    try std.testing.expect(isBuildStartLine("+- compile exe test debug"));
+    try std.testing.expect(!isBuildStartLine("install transitive failure"));
+    try std.testing.expect(!isBuildStartLine("+- install test transitive failure"));
+    try std.testing.expect(!isBuildStartLine("Build Summary: 1/3 steps succeeded"));
+}
+

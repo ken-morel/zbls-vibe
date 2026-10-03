@@ -1,11 +1,16 @@
 # zbls-vibe
 
+[![Vibe Coded with Antigravity](https://img.shields.io/badge/Vibe%20Coded%20with-Antigravity-4285F4?style=for-the-badge&logo=google)](https://github.com/google-deepmind)
+[![Zig](https://img.shields.io/badge/Zig-0.17%2B-orange?style=for-the-badge&logo=zig)](https://ziglang.org)
+
+> **Fully vibe coded with Antigravity** — an experimental companion language server born from human-AI pair programming with Google DeepMind's Antigravity.
+
 **zbls-vibe** (Zig Build Language Server) is a lightweight, companion Language Server Protocol (LSP) server for Zig.
 
 While [zls](https://github.com/zigtools/zls) excels at fast local AST completions, hover, and document symbols, it does not execute `build.zig`, full comptime type reflection, or cross-package compile checks. `zbls-vibe` runs alongside `zls` by executing:
 
 ```bash
-zig build -fincremental --watch --color off
+zig build -fincremental --watch
 ```
 
 in the background. Every time Zig notices a file change and rebuilds incrementally, `zbls-vibe` parses compiler errors, warnings, notes, and reference traces, publishing diagnostics directly to your editor in near real-time. When errors are resolved, diagnostics are immediately cleared.
@@ -57,7 +62,7 @@ command = "zbls-vibe"
 # Optional configuration:
 [language-server.zbls.config]
 # zigPath = "zig"
-# buildArgs = ["build", "-fincremental", "--watch", "--color", "off"]
+# buildArgs = ["build", "-fincremental", "--watch"]
 # extraArgs = []
 # debounceMs = 100
 
@@ -104,7 +109,7 @@ Using the generic LSP client configuration or settings:
 ```json
 {
   "zbls.zigPath": "zig",
-  "zbls.buildArgs": ["build", "-fincremental", "--watch", "--color", "off"],
+  "zbls.buildArgs": ["build", "-fincremental", "--watch"],
   "zbls.debounceMs": 100
 }
 ```

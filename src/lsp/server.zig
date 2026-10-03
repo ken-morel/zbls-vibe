@@ -13,9 +13,10 @@ pub const Server = struct {
     config: types.Config,
     workspace_root: ?[]const u8 = null,
     watcher: ?runner.Watcher = null,
-    diagnosed_files: std.StringHashMap(void),
+    current_diagnostics: std.StringHashMap([]const u8),
     diagnosed_mutex: Io.Mutex = .init,
     shutdown_requested: bool = false,
+    is_building: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: Allocator, io: Io, config: types.Config) Server {
         return .{
@@ -23,7 +24,7 @@ pub const Server = struct {
             .io = io,
             .transport = protocol.Transport.init(io),
             .config = config,
-            .diagnosed_files = std.StringHashMap(void).init(allocator),
+            .current_diagnostics = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -34,11 +35,12 @@ pub const Server = struct {
         if (self.workspace_root) |ws| {
             self.allocator.free(ws);
         }
-        var it = self.diagnosed_files.keyIterator();
-        while (it.next()) |k| {
-            self.allocator.free(k.*);
+        var it = self.current_diagnostics.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
         }
-        self.diagnosed_files.deinit();
+        self.current_diagnostics.deinit();
     }
 
     pub fn run(self: *Server) !void {
@@ -73,6 +75,8 @@ pub const Server = struct {
                     try self.handleInitialize(id_val, obj.get("params"));
                 } else if (std.mem.eql(u8, method, "initialized")) {
                     try self.handleInitialized();
+                } else if (std.mem.eql(u8, method, "textDocument/didOpen")) {
+                    self.handleDidOpen(obj.get("params"));
                 } else if (std.mem.eql(u8, method, "textDocument/didSave")) {
                     self.handleDidSave();
                 } else if (std.mem.eql(u8, method, "shutdown")) {
@@ -90,10 +94,40 @@ pub const Server = struct {
         }
     }
 
+    fn handleDidOpen(self: *Server, params_val: ?std.json.Value) void {
+        const params = params_val orelse return;
+        if (params != .object) return;
+        const td = params.object.get("textDocument") orelse return;
+        if (td != .object) return;
+        const uri_val = td.object.get("uri") orelse return;
+        if (uri_val != .string) return;
+        const uri = uri_val.string;
+
+        self.diagnosed_mutex.lockUncancelable(self.io);
+        defer self.diagnosed_mutex.unlock(self.io);
+
+        if (self.current_diagnostics.get(uri)) |cached_json| {
+            self.sendPublishDiagnostics(uri, cached_json) catch {};
+        }
+    }
+
     fn handleDidSave(self: *Server) void {
+        if (!self.is_building.swap(true, .acq_rel)) {
+            self.sendShowMessage(3, "[zbls-vibe] Building...") catch {};
+        }
         if (self.watcher) |*w| {
             w.wake();
         }
+    }
+
+    pub fn sendShowMessage(self: *Server, msg_type: u8, msg: []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":");
+        try buf.print(self.allocator, "{d},\"message\":", .{msg_type});
+        try appendJsonString(&buf, self.allocator, msg);
+        try buf.appendSlice(self.allocator, "}}");
+        try self.transport.writeMessage(buf.items);
     }
 
     fn handleInitialize(self: *Server, id_val: ?std.json.Value, params_val: ?std.json.Value) !void {
@@ -144,6 +178,7 @@ pub const Server = struct {
                 onLogMessage,
             );
             try self.watcher.?.start();
+            self.sendShowMessage(3, "[zbls-vibe] Watching zig build...") catch {};
         }
     }
 
@@ -249,15 +284,34 @@ pub const Server = struct {
     fn onBuildEvent(ctx: *anyopaque, event: diagnostics.BuildEvent) void {
         const self: *Server = @ptrCast(@alignCast(ctx));
         switch (event) {
+            .build_started => {
+                if (!self.is_building.swap(true, .acq_rel)) {
+                    self.sendShowMessage(3, "[zbls-vibe] Building...") catch {};
+                }
+            },
             .clean_success => {
+                _ = self.is_building.swap(false, .acq_rel);
                 self.clearAllDiagnostics();
+                self.sendShowMessage(3, "[zbls-vibe] Build succeeded (clean)") catch {};
             },
             .diagnostics_ready => |diags| {
                 defer self.allocator.free(diags);
+                _ = self.is_building.swap(false, .acq_rel);
+                const count = diags.len;
                 self.publishDiagnosticsList(diags);
                 for (diags) |*d| {
                     var mut_d = d.*;
                     mut_d.deinit(self.allocator);
+                }
+                if (count == 0) {
+                    self.sendShowMessage(3, "[zbls-vibe] Build succeeded") catch {};
+                } else {
+                    var msg_buf: [128]u8 = undefined;
+                    const msg = if (count == 1)
+                        "[zbls-vibe] Build failed (1 diagnostic)"
+                    else
+                        std.fmt.bufPrint(&msg_buf, "[zbls-vibe] Build failed ({d} diagnostics)", .{count}) catch "[zbls-vibe] Build failed";
+                    self.sendShowMessage(2, msg) catch {};
                 }
             },
             .none => {},
@@ -268,15 +322,13 @@ pub const Server = struct {
         self.diagnosed_mutex.lockUncancelable(self.io);
         defer self.diagnosed_mutex.unlock(self.io);
 
-        var it = self.diagnosed_files.keyIterator();
-        while (it.next()) |uri_ptr| {
-            self.sendPublishDiagnostics(uri_ptr.*, "[]") catch {};
+        var it = self.current_diagnostics.iterator();
+        while (it.next()) |entry| {
+            self.sendPublishDiagnostics(entry.key_ptr.*, "[]") catch {};
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
         }
-        var free_it = self.diagnosed_files.keyIterator();
-        while (free_it.next()) |k| {
-            self.allocator.free(k.*);
-        }
-        self.diagnosed_files.clearRetainingCapacity();
+        self.current_diagnostics.clearRetainingCapacity();
     }
 
     fn publishDiagnosticsList(self: *Server, diags: []diagnostics.RawMessage) void {
@@ -300,6 +352,9 @@ pub const Server = struct {
             res.value_ptr.append(self.allocator, d) catch {};
         }
 
+        var current_uris = std.StringHashMap(void).init(self.allocator);
+        defer current_uris.deinit();
+
         var file_it = files_in_build.iterator();
         while (file_it.next()) |entry| {
             const path = entry.key_ptr.*;
@@ -308,44 +363,52 @@ pub const Server = struct {
             const uri = self.pathToUri(path) catch continue;
             defer self.allocator.free(uri);
 
-            if (!self.diagnosed_files.contains(uri)) {
-                const stored_key = self.allocator.dupe(u8, uri) catch continue;
-                self.diagnosed_files.put(stored_key, {}) catch {};
+            current_uris.put(uri, {}) catch {};
+
+            const json = self.serializeDiagnostics(items) catch continue;
+
+            const gop = self.current_diagnostics.getOrPut(uri) catch {
+                self.allocator.free(json);
+                continue;
+            };
+
+            if (gop.found_existing) {
+                self.allocator.free(gop.value_ptr.*);
+                gop.value_ptr.* = json;
+            } else {
+                gop.key_ptr.* = self.allocator.dupe(u8, uri) catch {
+                    self.allocator.free(json);
+                    _ = self.current_diagnostics.remove(uri);
+                    continue;
+                };
+                gop.value_ptr.* = json;
             }
 
-            self.serializeAndSendDiagnostics(uri, items) catch {};
+            self.sendPublishDiagnostics(uri, json) catch {};
         }
 
-        var old_it = self.diagnosed_files.keyIterator();
         var files_to_remove: std.ArrayList([]const u8) = .empty;
         defer files_to_remove.deinit(self.allocator);
 
-        while (old_it.next()) |uri_ptr| {
-            var found = false;
-            var check_it = files_in_build.keyIterator();
-            while (check_it.next()) |p| {
-                const u = self.pathToUri(p.*) catch continue;
-                defer self.allocator.free(u);
-                if (std.mem.eql(u8, u, uri_ptr.*)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                self.sendPublishDiagnostics(uri_ptr.*, "[]") catch {};
-                files_to_remove.append(self.allocator, uri_ptr.*) catch {};
+        var old_it = self.current_diagnostics.iterator();
+        while (old_it.next()) |entry| {
+            if (!current_uris.contains(entry.key_ptr.*)) {
+                self.sendPublishDiagnostics(entry.key_ptr.*, "[]") catch {};
+                files_to_remove.append(self.allocator, entry.key_ptr.*) catch {};
             }
         }
 
         for (files_to_remove.items) |rem| {
-            _ = self.diagnosed_files.remove(rem);
-            self.allocator.free(rem);
+            if (self.current_diagnostics.fetchRemove(rem)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
         }
     }
 
-    fn serializeAndSendDiagnostics(self: *Server, uri: []const u8, items: []const diagnostics.RawMessage) !void {
+    fn serializeDiagnostics(self: *Server, items: []const diagnostics.RawMessage) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
+        errdefer buf.deinit(self.allocator);
 
         try buf.append(self.allocator, '[');
 
@@ -391,7 +454,7 @@ pub const Server = struct {
         }
 
         try buf.append(self.allocator, ']');
-        try self.sendPublishDiagnostics(uri, buf.items);
+        return buf.toOwnedSlice(self.allocator);
     }
 
     fn sendPublishDiagnostics(self: *Server, uri: []const u8, diags_json: []const u8) !void {
