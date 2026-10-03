@@ -1,71 +1,59 @@
 const std = @import("std");
-const Io = std.Io;
-
-const zbls_vibe = @import("zbls_vibe");
+const zbls = @import("zbls_vibe");
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
+    const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+
+    var config = zbls.types.Config{};
+    var extra_args: std.ArrayList([]const u8) = .empty;
+    defer extra_args.deinit(arena);
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            std.debug.print("zbls-vibe 0.1.0\n", .{});
+            return;
+        } else if (std.mem.eql(u8, arg, "--zig")) {
+            i += 1;
+            if (i < args.len) {
+                config.zig_path = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            while (i < args.len) : (i += 1) {
+                try extra_args.append(arena, args[i]);
+            }
+            break;
+        } else {
+            try extra_args.append(arena, arg);
+        }
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    config.extra_args = extra_args.items;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var server = zbls.server.Server.init(arena, init.io, config);
+    defer server.deinit();
 
-    try zbls_vibe.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    try server.run();
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try command `zig build test --fuzz -Doptimize=ReleaseFast` to see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+fn printUsage() void {
+    const usage =
+        \\zbls-vibe: Companion LSP server running `zig build -fincremental --watch`
+        \\
+        \\Usage:
+        \\  zbls-vibe [options] [-- <extra zig build args...>]
+        \\
+        \\Options:
+        \\  -h, --help       Show this help message
+        \\  -v, --version    Show version information
+        \\  --zig <path>     Path to zig executable (default: "zig")
+        \\
+    ;
+    std.debug.print("{s}", .{usage});
 }
